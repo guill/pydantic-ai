@@ -11,6 +11,7 @@ from typing import Any, Literal, Union, cast, overload
 from typing_extensions import assert_never
 
 from pydantic_ai.providers import Provider, infer_provider
+from pydantic_ai._result import ResultTool
 
 from .. import ModelHTTPError, UnexpectedModelBehavior, _utils, usage
 from .._utils import guard_tool_call_id as _guard_tool_call_id
@@ -53,10 +54,13 @@ try:
     )
     from openai.types.chat.chat_completion_content_part_image_param import ImageURL
     from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
+    from openai.types.chat.completion_create_params import ResponseFormat
+    from openai.types.chat.chat_completion_message_tool_call import Function
     from openai.types.responses import ComputerToolParam, FileSearchToolParam, WebSearchToolParam
     from openai.types.responses.response_input_param import FunctionCallOutput, Message
     from openai.types.shared import ReasoningEffort
-    from openai.types.shared_params import Reasoning
+    from openai.types.shared_params import Reasoning, FunctionDefinition
+    from openai.types.shared_params.response_format_json_schema import JSONSchema, ResponseFormatJSONSchema
 except ImportError as _import_error:
     raise ImportError(
         'Please install `openai` to use the OpenAI model, '
@@ -256,13 +260,28 @@ class OpenAIModel(Model):
         else:
             tool_choice = 'auto'
 
+        response_format = NOT_GIVEN
+        result_tool = None
+        if tool_choice == 'required' and len(model_request_parameters.result_tools) > 0:
+            result_tool = model_request_parameters.result_tools[0]
+            tool_choice = 'none'
+            tools = []
+            response_format = ResponseFormatJSONSchema(
+                json_schema=JSONSchema(
+                    name=result_tool.name,
+                    schema=result_tool.parameters_json_schema,
+                    description=result_tool.description,
+                    strict=result_tool.strict,
+                ),
+                type = 'json_schema',
+            )
         openai_messages: list[chat.ChatCompletionMessageParam] = []
         for m in messages:
             async for msg in self._map_message(m):
                 openai_messages.append(msg)
 
         try:
-            return await self.client.chat.completions.create(
+            result = await self.client.chat.completions.create(
                 model=self._model_name,
                 messages=openai_messages,
                 n=1,
@@ -281,7 +300,30 @@ class OpenAIModel(Model):
                 logit_bias=model_settings.get('logit_bias', NOT_GIVEN),
                 reasoning_effort=model_settings.get('openai_reasoning_effort', NOT_GIVEN),
                 user=model_settings.get('openai_user', NOT_GIVEN),
+                response_format=response_format,
             )
+            assert isinstance(result, chat.ChatCompletion)
+            if result_tool is not None:
+                # If we had a result tool, we want to modify the result to include the simulated tool call
+                # to `final_result`.
+                assert len(result.choices) == 1
+                assert result.choices[0].message.tool_calls is None
+                assert result.choices[0].message.content is not None
+                result.choices[0].finish_reason = 'tool_calls'
+                result.choices[0].message.tool_calls = [
+                    chat.ChatCompletionMessageToolCall(
+                        id=result_tool.name,
+                        type='function',
+                        function=Function(
+                            name=result_tool.name,
+                            arguments=result.choices[0].message.content,
+                        ),
+                    )
+                ]
+                result.choices[0].message.content = None
+
+
+            return result
         except APIStatusError as e:
             if (status_code := e.status_code) >= 400:
                 raise ModelHTTPError(status_code=status_code, model_name=self.model_name, body=e.body) from e
